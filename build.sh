@@ -17,8 +17,9 @@ mkdir -p "$APP_DIR/Contents/Resources"
 # Copy binary
 cp .build/release/DisplayBuddy "$APP_DIR/Contents/MacOS/"
 
-# Copy Info.plist
+# Copy Info.plist and icon
 cp Resources/Info.plist "$APP_DIR/Contents/"
+cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
 
 # Ad-hoc code sign (required for IOKit access)
 codesign --force --sign - "$APP_DIR"
