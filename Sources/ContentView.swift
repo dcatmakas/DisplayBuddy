@@ -64,13 +64,6 @@ struct DisplayRow: View {
                         .padding(.vertical, 2)
                         .background(Capsule().fill(.red.opacity(0.2)))
                         .foregroundStyle(.red)
-                } else if display.isMirrored {
-                    Text("Mirrored")
-                        .font(.caption2)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(.orange.opacity(0.2)))
-                        .foregroundStyle(.orange)
                 }
             }
 
@@ -117,35 +110,18 @@ struct DisplayRow: View {
 
             // External display controls
             if !display.isBuiltIn {
-                HStack(spacing: 8) {
-                    if !display.isPoweredOff {
-                        Button {
-                            manager.toggleMirror(display.id)
-                        } label: {
-                            Label(
-                                display.isMirrored ? "Unmirror" : "Mirror",
-                                systemImage: display.isMirrored ? "rectangle.on.rectangle.slash" : "rectangle.on.rectangle"
-                            )
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(display.isMirrored ? .green : .orange)
-                        .controlSize(.small)
-                    }
-
-                    Button {
-                        manager.togglePower(display.id)
-                    } label: {
-                        Label(
-                            display.isPoweredOff ? "Power On" : "Power Off",
-                            systemImage: display.isPoweredOff ? "power.circle.fill" : "power.circle"
-                        )
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(display.isPoweredOff ? .green : .red)
-                    .controlSize(.small)
+                Button {
+                    manager.togglePower(display.id)
+                } label: {
+                    Label(
+                        display.isPoweredOff ? "Power On" : "Power Off",
+                        systemImage: display.isPoweredOff ? "power.circle.fill" : "power.circle"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
+                .tint(display.isPoweredOff ? .green : .red)
+                .controlSize(.small)
             }
         }
         .padding(10)

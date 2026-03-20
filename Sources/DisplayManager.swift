@@ -9,7 +9,6 @@ struct DisplayInfo: Identifiable {
     let isBuiltIn: Bool
     var brightness: Double
     var supportsBrightness: Bool
-    var isMirrored: Bool
     var isPoweredOff: Bool
 }
 
@@ -19,22 +18,24 @@ class DisplayManager: ObservableObject {
 
     private var ddcServices: [CGDirectDisplayID: CFTypeRef] = [:]
     private var ddcMaxBrightness: [CGDirectDisplayID: UInt16] = [:]
-    private var debounceTimers: [CGDirectDisplayID: Timer] = [:]
     private var servicesDiscovered = false
     private let ddcQueue = DispatchQueue(label: "com.displaybuddy.ddc", qos: .userInitiated)
 
     // Remember powered-off displays so they stay in UI
     private var poweredOffDisplays: [CGDirectDisplayID: DisplayInfo] = [:]
 
+    // Track last DDC write time to avoid flooding the I2C bus
+    private var lastDDCWrite: [CGDirectDisplayID: Date] = [:]
+    private let ddcMinInterval: TimeInterval = 0.05
+
     init() {
         loadDisplayList()
         discoverDDCAsync()
     }
 
-    // MARK: - Display list (uses Online list to include mirrored displays)
+    // MARK: - Display list
 
     private func loadDisplayList() {
-        // CGGetOnlineDisplayList returns ALL connected displays, including mirrored ones
         var displayIDs = [CGDirectDisplayID](repeating: 0, count: 16)
         var displayCount: UInt32 = 0
         CGGetOnlineDisplayList(16, &displayIDs, &displayCount)
@@ -50,7 +51,6 @@ class DisplayManager: ObservableObject {
             let name = getDisplayName(displayID)
                 ?? poweredOffDisplays[displayID]?.name
                 ?? (isBuiltIn ? "Built-in Display" : "External Display")
-            let isMirrored = CGDisplayMirrorsDisplay(displayID) != kCGNullDirectDisplay
 
             let existing = displays.first(where: { $0.id == displayID })
             let isPoweredOff = poweredOffDisplays[displayID]?.isPoweredOff
@@ -69,12 +69,10 @@ class DisplayManager: ObservableObject {
                 isBuiltIn: isBuiltIn,
                 brightness: brightness,
                 supportsBrightness: supportsBrightness,
-                isMirrored: isMirrored,
                 isPoweredOff: isPoweredOff
             ))
         }
 
-        // Also add any powered-off displays that disappeared from the online list
         for (id, info) in poweredOffDisplays where !seenIDs.contains(id) {
             newDisplays.append(info)
         }
@@ -118,7 +116,6 @@ class DisplayManager: ObservableObject {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // Merge with existing services (don't lose powered-off display services)
                 for (id, svc) in newServices { self.ddcServices[id] = svc }
                 for (id, max) in newMaxBrightness { self.ddcMaxBrightness[id] = max }
                 self.servicesDiscovered = true
@@ -175,21 +172,36 @@ class DisplayManager: ObservableObject {
         guard let index = displays.firstIndex(where: { $0.id == id }) else { return }
         displays[index].brightness = value
 
-        debounceTimers[id]?.invalidate()
-        debounceTimers[id] = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
-            self?.commitBrightness(id, value: value)
-        }
-    }
+        let isBuiltIn = displays[index].isBuiltIn
 
-    private func commitBrightness(_ id: CGDirectDisplayID, value: Double) {
-        let isBuiltIn = displays.first(where: { $0.id == id })?.isBuiltIn ?? false
+        if isBuiltIn {
+            // Built-in display: apply immediately (fast API)
+            _ = DisplayServicesSetBrightness(id, Float(value))
+        } else if let service = ddcServices[id] {
+            // DDC: rate-limit to avoid flooding I2C bus
+            let now = Date()
+            if let last = lastDDCWrite[id], now.timeIntervalSince(last) < ddcMinInterval {
+                // Schedule the latest value after the minimum interval
+                let delay = ddcMinInterval - now.timeIntervalSince(last)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    // Only fire if the value hasn't changed again
+                    if self.displays.first(where: { $0.id == id })?.brightness == value {
+                        self.lastDDCWrite[id] = Date()
+                        let maxVal = self.ddcMaxBrightness[id] ?? 100
+                        let ddcValue = UInt16(value * Double(maxVal))
+                        self.ddcQueue.async {
+                            DDCService.writeBrightness(service: service, value: ddcValue)
+                        }
+                    }
+                }
+                return
+            }
 
-        ddcQueue.async { [weak self] in
-            if isBuiltIn {
-                _ = DisplayServicesSetBrightness(id, Float(value))
-            } else if let service = self?.ddcServices[id] {
-                let maxVal = self?.ddcMaxBrightness[id] ?? 100
-                let ddcValue = UInt16(value * Double(maxVal))
+            lastDDCWrite[id] = now
+            let maxVal = ddcMaxBrightness[id] ?? 100
+            let ddcValue = UInt16(value * Double(maxVal))
+            ddcQueue.async {
                 DDCService.writeBrightness(service: service, value: ddcValue)
             }
         }
@@ -197,42 +209,14 @@ class DisplayManager: ObservableObject {
 
     func setSoftwareBrightness(_ id: CGDirectDisplayID, value: Double) {
         softwareBrightness[id] = value
-
-        debounceTimers[id]?.invalidate()
-        debounceTimers[id] = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { _ in
-            let gamma = Float(max(value, 0.01))
-            CGSetDisplayTransferByFormula(
-                id,
-                0, gamma, 1.0,
-                0, gamma, 1.0,
-                0, gamma, 1.0
-            )
-        }
-    }
-
-    // MARK: - Mirror / Disable Display
-
-    func toggleMirror(_ id: CGDirectDisplayID) {
-        guard let index = displays.firstIndex(where: { $0.id == id }) else { return }
-        let currentlyMirrored = displays[index].isMirrored
-
-        var config: CGDisplayConfigRef?
-        CGBeginDisplayConfiguration(&config)
-
-        if currentlyMirrored {
-            CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay)
-        } else {
-            let mainDisplay = CGMainDisplayID()
-            if id != mainDisplay {
-                CGConfigureDisplayMirrorOfDisplay(config, id, mainDisplay)
-            }
-        }
-
-        CGCompleteDisplayConfiguration(config, .forSession)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.loadDisplayList()
-        }
+        // Apply immediately
+        let gamma = Float(max(value, 0.01))
+        CGSetDisplayTransferByFormula(
+            id,
+            0, gamma, 1.0,
+            0, gamma, 1.0,
+            0, gamma, 1.0
+        )
     }
 
     // MARK: - Power Control (mirror + blackout + DDC)
@@ -243,28 +227,22 @@ class DisplayManager: ObservableObject {
 
         if isPoweredOff {
             // === POWER ON ===
-            // 1. Un-mirror
             var config: CGDisplayConfigRef?
             CGBeginDisplayConfiguration(&config)
             CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay)
             CGCompleteDisplayConfiguration(config, .forSession)
 
-            // 2. Restore gamma
             CGDisplayRestoreColorSyncSettings()
 
-            // 3. Remove from powered-off tracking
             poweredOffDisplays.removeValue(forKey: id)
             displays[index].isPoweredOff = false
-            displays[index].isMirrored = false
 
-            // 4. DDC power on
             ddcQueue.async { [weak self] in
                 if let service = self?.ddcServices[id] {
                     DDCService.writeVCP(service: service, code: 0xD6, value: 1)
                 }
             }
 
-            // 5. Refresh display list after settle
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 self?.loadDisplayList()
             }
@@ -272,23 +250,17 @@ class DisplayManager: ObservableObject {
             // === POWER OFF ===
             let mainDisplay = CGMainDisplayID()
 
-            // If this IS the main display, we need to pick another as main first
-            // (mirror target must be the main display)
             let mirrorTarget: CGDirectDisplayID
             if id == mainDisplay {
-                // Find another non-built-in display or built-in to be the target
                 let otherDisplay = displays.first(where: { $0.id != id && !$0.isPoweredOff })?.id ?? id
                 mirrorTarget = otherDisplay
             } else {
                 mirrorTarget = mainDisplay
             }
 
-            // 1. Save display info before it disappears
             displays[index].isPoweredOff = true
-            displays[index].isMirrored = true
             poweredOffDisplays[id] = displays[index]
 
-            // 2. Mirror (makes macOS treat it as same desktop)
             if id != mirrorTarget {
                 var config: CGDisplayConfigRef?
                 CGBeginDisplayConfiguration(&config)
@@ -296,15 +268,12 @@ class DisplayManager: ObservableObject {
                 CGCompleteDisplayConfiguration(config, .forSession)
             }
 
-            // 3. Blackout after mirror settles
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 let zeroTable = [CGGammaValue](repeating: 0.0, count: 256)
                 CGSetDisplayTransferByTable(id, 256, zeroTable, zeroTable, zeroTable)
-                // Reload list so mirrored display still appears
                 self?.loadDisplayList()
             }
 
-            // 4. DDC standby
             ddcQueue.async { [weak self] in
                 if let service = self?.ddcServices[id] {
                     DDCService.writeVCP(service: service, code: 0xD6, value: 5)
